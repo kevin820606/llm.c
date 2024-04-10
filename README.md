@@ -1,3 +1,15 @@
+
+# Disclaimer
+
+This Fork is only for practicing migrating C code to Windows and would possible not active any time soon.
+
+I try to migrate the code to work on Windows with Clang.
+The code can be compile with following command.
+
+```pwsh
+clang -o .\train_gpt2.exe .\train_gpt2.c -O3 -Ofast -Wno-unused-result -fopenmp -DOMP
+```
+
 # llm.c
 
 LLM training in simple, pure C/CUDA. There is no need for 245MB of PyTorch or 107MB of cPython. For example, training GPT-2 (CPU, fp32) is ~1,000 lines of clean code in a single file. It compiles and runs instantly, and exactly matches the PyTorch reference implementation. I chose GPT-2 as the first working example because it is the grand-daddy of LLMs, the first time the modern stack was put together.
