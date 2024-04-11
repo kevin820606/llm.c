@@ -8,7 +8,8 @@ This version is the clean, minimal, reference. As such:
 cost There will be other versions of this code that specialize it and make it
 fast.
 */
-
+#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_NONSTDC_NO_WARNINGS
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -599,9 +600,8 @@ typedef struct {
 void gpt2_build_from_checkpoint(GPT2 *model, char *checkpoint_path) {
 
   // read in model from a checkpoint file
-  FILE *model_file;
-  errno_t err = fopen_s(&model_file, checkpoint_path, "rb");
-  if (err != 0) {
+  FILE *model_file = fopen(checkpoint_path, "rb");
+  if (model_file == NULL) {
     printf("Error opening model file\n");
     exit(1);
   }
@@ -1035,11 +1035,8 @@ void dataloader_init(DataLoader *loader, char *filename, int B, int T) {
   loader->T = T;
 
   // open the input file for reading
-  FILE *data_file;
-  errno_t err = fopen_s(&data_file, filename, "rb");
-  if (err == 0)
-    loader->tokens_file = data_file;
-  else {
+  loader->tokens_file = fopen(filename, "rb");
+  if (loader->tokens_file == NULL) {
     printf("Error opening tokens file\n");
     exit(1);
   }
@@ -1127,10 +1124,10 @@ int main() {
   char *tiny_stories_val = "data/TinyStories_val.bin";
   char *tiny_shakespeare_train = "data/tiny_shakespeare_train.bin";
   char *tiny_shakespeare_val = "data/tiny_shakespeare_val.bin";
-  char *train_tokens = _access(tiny_shakespeare_train, F_OK) != -1
+  char *train_tokens = access(tiny_shakespeare_train, F_OK) != -1
                            ? tiny_shakespeare_train
                            : tiny_stories_train;
-  char *val_tokens = _access(tiny_shakespeare_val, F_OK) != -1
+  char *val_tokens = access(tiny_shakespeare_val, F_OK) != -1
                          ? tiny_shakespeare_val
                          : tiny_stories_val;
   int B = 4;
