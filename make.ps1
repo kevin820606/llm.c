@@ -1,8 +1,11 @@
-
 param (
   [string]$target = "all"
 )
 
+if (-not $compiler)
+{
+  $compiler = "clang"
+}
 # Splitting the flags into an array of individual flags
 $cflags = @("-O3", "-Ofast", "-Wno-unused-result", "-fopenmp", "-DOMP")
 
@@ -15,13 +18,13 @@ $test_src = ".\test_gpt2.c"
 function Build-Train
 {
   # Using the splatting feature to pass each flag as a separate argument
-  clang -o $train_exe $train_src @cflags
+  & $compiler -o $train_exe $train_src @cflags
 }
 
 function Build-Test
 {
   # Using the splatting feature to pass each flag as a separate argument
-  clang -o $test_exe $test_src @cflags
+  & $compiler -o $test_exe $test_src @cflags
 }
 
 switch ($target)
