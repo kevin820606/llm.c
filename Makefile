@@ -11,28 +11,35 @@ INCLUDES =
 # e.g. on Ubuntu: sudo apt-get install libomp-dev
 # later, run the program by prepending the number of threads, e.g.: OMP_NUM_THREADS=8 ./gpt2
 ifeq ($(shell uname), Darwin)
-  # Check if the libomp directory exists
+  # macOS
   ifeq ($(shell [ -d /opt/homebrew/opt/libomp/lib ] && echo "exists"), exists)
     # macOS with Homebrew and directory exists
     CFLAGS += -Xclang -fopenmp -DOMP
     LDFLAGS += -L/opt/homebrew/opt/libomp/lib
     LDLIBS += -lomp
     INCLUDES += -I/opt/homebrew/opt/libomp/include
-    $(info NICE Compiling with OpenMP support)
+    $(info Compiling with OpenMP support on macOS)
   else
-    $(warning OOPS Compiling without OpenMP support)
+    $(warning Compiling without OpenMP support on macOS)
   endif
 else
-  ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
-    # Ubuntu or other Linux distributions
+  # Other Unix-like systems
+  ifeq ($(shell $(CC) --version | grep -o 'clang' | head -n1), clang)
+    # Using clang
     CFLAGS += -fopenmp -DOMP
-    LDLIBS += -lgomp
-    $(info NICE Compiling with OpenMP support)
+    LDLIBS += -lomp
+    $(info Compiling with OpenMP support using clang)
   else
-    $(warning OOPS Compiling without OpenMP support)
+    # Other compilers
+    ifeq ($(shell echo | $(CC) -fopenmp -x c -E - > /dev/null 2>&1; echo $$?), 0)
+      CFLAGS += -fopenmp -DOMP
+      LDLIBS += -lgomp
+      $(info Compiling with OpenMP support)
+    else
+      $(warning Compiling without OpenMP support)
+    endif
   endif
 endif
-
 # PHONY means these targets will always be executed
 .PHONY: all train_gpt2 test_gpt2
 

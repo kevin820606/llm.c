@@ -14,20 +14,24 @@ fast.
 #include <string.h>
 #include <time.h>
 
-#ifdef _MSC_VER
+#if defined _MSC_VER || defined __MINGW32__
 #define _USE_MATH_DEFINES
 #include <io.h>
+#include <stdint.h>
 #include <windows.h>
 
+#ifndef CLOCK_MONOTONIC
 #define CLOCK_MONOTONIC GetTickCount()
+#endif
+
 #define F_OK 0
 int clock_gettime(int X, struct timespec *spec) // C-file part
 {
-  __int64 wintime;
+  int64_t wintime;
   GetSystemTimeAsFileTime((FILETIME *)&wintime);
-  wintime -= 116444736000000000i64;            // 1jan1601 to 1jan1970
-  spec->tv_sec = wintime / 10000000i64;        // seconds
-  spec->tv_nsec = wintime % 10000000i64 * 100; // nano-seconds
+  wintime -= 116444736000000000LL;            // 1jan1601 to 1jan1970
+  spec->tv_sec = wintime / 10000000LL;        // seconds
+  spec->tv_nsec = wintime % 10000000LL * 100; // nano-seconds
   return 0;
 }
 #else
