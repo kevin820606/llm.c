@@ -28,9 +28,12 @@ int clock_gettime(int X, struct timespec *spec) // C-file part
 }
 #else
 #include <unistd.h>
+#include <assert.h>
 #endif /* ifdef _MSC_VER */
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <io.h>
 #include <math.h>
 
@@ -87,75 +90,53 @@ __global__ void encoder_forward_kernel2(float *out, int *inp, float *wte,
   }
 }
 
-__global__ void mean_kernel(float *mean, float *inp, int N, int C,
-                            int block_size) {
-  extern __shared__ float shared[];
-  int idx = blockIdx.x;  // range [0, B*T)
-  int tid = threadIdx.x; // range [0, block_size)
-  float *x = inp + idx * C;
-  // thread coarsening
-  float sum = 0.0f;
-  for (int i = tid; i < C; i += block_size) {
-    sum += x[i];
-  }
-  shared[tid] = sum;
-  __syncthreads();
-  // reductions
-  for (int stride = block_size / 2; stride >= 1; stride /= 2) {
-    __syncthreads();
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
+
+__global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __restrict__ mean, float* __restrict__ rstd,
+                                    const float*  __restrict__ inp, const float*  __restrict__ weight,
+                                    const float* __restrict__ bias, int N, int C) {
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= N) {
+        return;
     }
-  }
-  // write the final result (at thread 0) to global memory
-  if (tid == 0) {
-    mean[idx] = shared[0] / C;
-  }
-}
 
-__global__ void rstd_kernel(float *rstd, float *inp, float *mean, int N, int C,
-                            int block_size) {
-  extern __shared__ float shared[];
-  int idx = blockIdx.x;  // range [0, B*T)
-  int tid = threadIdx.x; // range [0, block_size)
-  float *x = inp + idx * C;
-  float m = mean[idx];
-  // thread coarsening
-  float sum = 0.0f;
-  for (int i = tid; i < C; i += block_size) {
-    float diff = x[i] - m;
-    sum += diff * diff;
-  }
-  shared[tid] = sum;
-  __syncthreads();
-  // reductions
-  for (int stride = block_size / 2; stride >= 1; stride /= 2) {
-    __syncthreads();
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
+    // the row of input that this group of threads is responsible for
+    const float* x = inp + idx * C;
+
+    // mean
+    float sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        sum += x[i];
     }
-  }
-  // write the final result (at thread 0) to global memory
-  if (tid == 0) {
-    rstd[idx] = 1.0f / sqrtf(shared[0] / C + 1e-5f);
-  }
-}
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float m = sum / C;
+    if(warp.thread_rank() == 0 && mean != nullptr) {
+        __stcs(mean + idx, m);
+    }
 
-__global__ void normalization_kernel(float *out, float *inp, float *mean,
-                                     float *rstd, float *weight, float *bias,
-                                     int B, int T, int C) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // rstd
+    sum = 0.0f;
+    for (int i = warp.thread_rank(); i < C; i += warp.size()) {
+        float diff = x[i] - m;
+        sum += diff * diff;
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    float s = rsqrtf(sum / C + 1e-5f);
+    if(warp.thread_rank() == 0 && rstd != nullptr) {
+        __stcs(rstd + idx, s);
+    }
 
-  int bt = idx / C;
-  int c = idx % C;
-
-  float m = mean[bt];
-  float s = rstd[bt];
-  float xi = inp[idx];
-  float n = s * (xi - m);
-  float o = n * weight[c] + bias[c];
-
-  out[idx] = o;
+    // final normalization and scaling by weight/bias
+    float* o = out + idx * C;
+    for (int c = warp.thread_rank(); c < C; c += warp.size()) {
+        // load and store using the .cs "streaming" hint to the compiler,
+        // indicating that this data will not be reused soon, and can be streamed through the caches
+        // this allows the threads to get more cache-hits for the (shared) weight and bias parameters
+        float n = s * (__ldcs(x+c) - m);
+        __stcs(o+c, n * weight[c] + bias[c]);
+    }
 }
 
 __global__ void add_bias(float *out, float *bias, int B, int T, int OC) {
@@ -327,14 +308,14 @@ __global__ void residual_forward_kernel(float *out, float *inp1, float *inp2,
   }
 }
 
-__global__ void gelu_kernel(float *out, const float *inp, int N) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  float s = sqrtf(2.0f / M_PI);
-  if (i < N) {
-    float xi = inp[i];
-    float cube = 0.044715f * xi * xi * xi;
-    out[i] = 0.5f * xi * (1.0f + tanhf(s * (xi + cube)));
-  }
+#define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+__global__ void gelu_kernel(float* out, const float* inp, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        float xi = inp[i];
+        float cube = 0.044715f * xi * xi * xi;
+        out[i] = 0.5f * xi * (1.0f + tanhf(GELU_SCALING_FACTOR * (xi + cube)));
+    }
 }
 
 __global__ void crossentropy_forward_kernel1(float *losses, float *probs,
@@ -363,23 +344,14 @@ void encoder_forward(float *out, int *inp, float *wte, float *wpe, int B, int T,
   cudaCheck(cudaGetLastError());
 }
 
-void layernorm_forward(float *out, float *mean, float *rstd, float *inp,
-                       float *weight, float *bias, int B, int T, int C) {
-  int N = B * T;
-  const int block_size = 128;
-  // in mean and rstd, threads cooperate within blocks via reductions
-  mean_kernel<<<B * T, block_size, block_size * sizeof(float)>>>(mean, inp, N,
-                                                                 C, block_size);
-  cudaCheck(cudaGetLastError());
-  rstd_kernel<<<B * T, block_size, block_size * sizeof(float)>>>(
-      rstd, inp, mean, N, C, block_size);
-  cudaCheck(cudaGetLastError());
-  // in the normalization, everything just gets flattened out
-  const int block_size2 = 256;
-  const int grid_size = CEIL_DIV(B * T * C, block_size2);
-  normalization_kernel<<<grid_size, block_size2>>>(out, inp, mean, rstd, weight,
-                                                   bias, B, T, C);
-  cudaCheck(cudaGetLastError());
+void layernorm_forward(float* out, float* mean, float* rstd,
+                       float* inp, float* weight, float* bias,
+                       int B, int T, int C) {
+    const int block_size = 1024;
+    const int N = B * T;
+    const int grid_size = CEIL_DIV(N * 32, block_size);
+    layernorm_forward_kernel3<<<grid_size, block_size>>>(out, mean, rstd, inp, weight, bias, N, C);
+    cudaCheck(cudaGetLastError());
 }
 
 // kernel 1 is the most naive matmul kernel
@@ -682,23 +654,23 @@ void gpt2_build_from_checkpoint(GPT2 *model, char *checkpoint_path) {
   printf("num_heads: %d\n", NH);
   printf("channels: %d\n", C);
 
-  // allocate space for all the parameters and read them in
-  model->param_sizes[0] = V * C;
-  model->param_sizes[1] = maxT * C;
-  model->param_sizes[2] = L * C;
-  model->param_sizes[3] = L * C;
-  model->param_sizes[4] = L * (3 * C) * C;
-  model->param_sizes[5] = L * (3 * C);
-  model->param_sizes[6] = L * C * C;
-  model->param_sizes[7] = L * C;
-  model->param_sizes[8] = L * C;
-  model->param_sizes[9] = L * C;
-  model->param_sizes[10] = L * (4 * C) * C;
-  model->param_sizes[11] = L * (4 * C);
-  model->param_sizes[12] = L * C * (4 * C);
-  model->param_sizes[13] = L * C;
-  model->param_sizes[14] = C;
-  model->param_sizes[15] = C;
+    // allocate space for all the parameters and read them in
+    model->param_sizes[0] = V * C; // wte
+    model->param_sizes[1] = maxT * C; // wpe
+    model->param_sizes[2] = L * C; // ln1w
+    model->param_sizes[3] = L * C; // ln1b
+    model->param_sizes[4] = L * (3 * C) * C; // qkvw
+    model->param_sizes[5] = L * (3 * C); // qkvb
+    model->param_sizes[6] = L * C * C; // attprojw
+    model->param_sizes[7] = L * C; // attprojb
+    model->param_sizes[8] = L * C; // ln2w
+    model->param_sizes[9] = L * C; // ln2b
+    model->param_sizes[10] = L * (4 * C) * C; // fcw
+    model->param_sizes[11] = L * (4 * C); // fcb
+    model->param_sizes[12] = L * C * (4 * C); // fcprojw
+    model->param_sizes[13] = L * C; // fcprojb
+    model->param_sizes[14] = C; // lnfw
+    model->param_sizes[15] = C; // lnfb
 
   // cound the number of paramaters
   size_t num_parameters = 0;
@@ -748,59 +720,56 @@ void gpt2_forward(GPT2 *model, int *inputs, int *targets, int B, int T) {
   int NH = model->config.num_heads;
   int C = model->config.channels;
 
-  // allocate space for all the activations if needed (done here, lazily)
-  if (model->acts_memory == NULL) {
-    // record the current B,T as well
-    model->batch_size = B;
-    model->seq_len = T;
-    // and now allocate the space
-    model->act_sizes[0] = B * T * C;
-    model->act_sizes[1] = L * B * T * C;
-    model->act_sizes[2] = L * B * T;
-    model->act_sizes[3] = L * B * T;
-    model->act_sizes[4] = L * B * T * 3 * C;
-    model->act_sizes[5] = L * B * T * C;
-    model->act_sizes[6] = L * B * NH * T * T;
-    model->act_sizes[7] = L * B * NH * T * T;
-    model->act_sizes[8] = L * B * T * C;
-    model->act_sizes[9] = L * B * T * C;
-    model->act_sizes[10] = L * B * T * C;
-    model->act_sizes[11] = L * B * T;
-    model->act_sizes[12] = L * B * T;
-    model->act_sizes[13] = L * B * T * 4 * C;
-    model->act_sizes[14] = L * B * T * 4 * C;
-    model->act_sizes[15] = L * B * T * C;
-    model->act_sizes[16] = L * B * T * C;
-    model->act_sizes[17] = B * T * C;
-    model->act_sizes[18] = B * T;
-    model->act_sizes[19] = B * T;
-    model->act_sizes[20] = B * T * V;
-    model->act_sizes[21] = B * T * V;
-    model->act_sizes[22] = B * T;
-    model->act_sizes[23] = L * B * T * 3 * C; // qkvr
-    model->act_sizes[24] = L * B * T * C;     // v_accum
-    size_t num_activations = 0;
-    for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
-      num_activations += model->act_sizes[i];
+    // allocate space for all the activations if needed (done here, lazily)
+    if(model->acts_memory == NULL) {
+        // record the current B,T as well
+        model->batch_size = B;
+        model->seq_len = T;
+        // and now allocate the space
+        model->act_sizes[0] = B * T * C; // encoded
+        model->act_sizes[1] = L * B * T * C; // ln1
+        model->act_sizes[2] = L * B * T; // ln1_mean
+        model->act_sizes[3] = L * B * T; // ln1_rstd
+        model->act_sizes[4] = L * B * T * 3*C; // qkv
+        model->act_sizes[5] = L * B * T * C; // atty
+        model->act_sizes[6] = L * B * NH * T * T; // preatt
+        model->act_sizes[7] = L * B * NH * T * T; // att
+        model->act_sizes[8] = L * B * T * C; // attproj
+        model->act_sizes[9] = L * B * T * C; // residual2
+        model->act_sizes[10] = L * B * T * C; // ln2
+        model->act_sizes[11] = L * B * T; // ln2_mean
+        model->act_sizes[12] = L * B * T; // ln2_rstd
+        model->act_sizes[13] = L * B * T * 4*C; // fch
+        model->act_sizes[14] = L * B * T * 4*C; // fch_gelu
+        model->act_sizes[15] = L * B * T * C; // fcproj
+        model->act_sizes[16] = L * B * T * C; // residual3
+        model->act_sizes[17] = B * T * C; // lnf
+        model->act_sizes[18] = B * T; // lnf_mean
+        model->act_sizes[19] = B * T; // lnf_rstd
+        model->act_sizes[20] = B * T * V; // logits
+        model->act_sizes[21] = B * T * V; // probs
+        model->act_sizes[22] = B * T; // losses
+        model->act_sizes[23] = L * B * T * 3*C; // qkvr
+        model->act_sizes[24] = L * B * T * C; // v_accum
+        size_t num_activations = 0;
+        for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
+            num_activations += model->act_sizes[i];
+        }
+        printf("num_activations: %zu\n", num_activations);
+        model->num_activations = num_activations;
+        model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        // also create memory for caching inputs and targets
+        cudaCheck(cudaMalloc((void**)&model->inputs, B * T * sizeof(int)));
+        cudaCheck(cudaMalloc((void**)&model->targets, B * T * sizeof(int)));
+    } else {
+        // validate B,T is no larger than what was previously allocated
+        // in principle, we could re-allocate a larger chunk of memory, for now we just error out
+        if (B > model->batch_size || T > model->seq_len) {
+            printf("Error: batch size or sequence length is inadequately large\n");
+            printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size, model->seq_len, B, T);
+            exit(1);
+        }
     }
-    printf("num_activations: %zu\n", num_activations);
-    model->num_activations = num_activations;
-    model->acts_memory =
-        malloc_and_point_activations(&model->acts, model->act_sizes);
-    // also create memory for caching inputs and targets
-    cudaCheck(cudaMalloc((void **)&model->inputs, B * T * sizeof(int)));
-    cudaCheck(cudaMalloc((void **)&model->targets, B * T * sizeof(int)));
-  } else {
-    // validate B,T is no larger than what was previously allocated
-    // in principle, we could re-allocate a larger chunk of memory, for now we
-    // just error out
-    if (B > model->batch_size || T > model->seq_len) {
-      printf("Error: batch size or sequence length is inadequately large\n");
-      printf("Model: B=%d T=%d, Desired: B=%d T=%d\n", model->batch_size,
-             model->seq_len, B, T);
-      exit(1);
-    }
-  }
 
   // copy inputs/targets to the model
   cudaCheck(cudaMemcpy(model->inputs, inputs, B * T * sizeof(int),
