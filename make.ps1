@@ -1,45 +1,68 @@
+
 param (
   [string]$target = "all"
 )
 
+# Default compiler set up
 if (-not $compiler)
 {
   $compiler = "clang"
 }
-# Splitting the flags into an array of individual flags
+
+# Compiler flags
 $cflags = @("-O3", "-Ofast", "-Wno-unused-result", "-fopenmp", "-DOMP")
+$cuflags = @("-O3", "--use_fast_math", "-lcublas", "-lcublasLt", "-Xcompiler", "/wd4819")
 
-# File names
-$train_exe = ".\train_gpt2.exe"
-$test_exe = ".\test_gpt2.exe"
-$train_src = ".\train_gpt2.c"
-$test_src = ".\test_gpt2.c"
+# File names setup
+$exe_suffix = ".exe"
+$src_suffix = ".c"
+$gpu_src_suffix = ".cu"
 
-function Build-Train
+# Helper function to build projects
+function Build-Project
 {
-  # Using the splatting feature to pass each flag as a separate argument
-  & $compiler -o $train_exe $train_src @cflags
+  param (
+    [string]$outputFile,
+    [string]$sourceFile,
+    [string[]]$flags,
+    [string]$compiler = $compiler
+  )
+  & $compiler -o $outputFile $sourceFile @flags
 }
 
-function Build-Test
-{
-  # Using the splatting feature to pass each flag as a separate argument
-  & $compiler -o $test_exe $test_src @cflags
-}
-
+# Mapping targets to their corresponding build actions
 switch ($target)
 {
   "all"
   {
-    Build-Train
-    Build-Test
+    Build-Project ".\train_gpt2$exe_suffix" ".\train_gpt2$src_suffix" $cflags
+    Build-Project ".\test_gpt2$exe_suffix" ".\test_gpt2$src_suffix" $cflags
+    Build-Project ".\train_gpt2cu$exe_suffix" ".\train_gpt2$gpu_src_suffix" $cuflags "nvcc"
+    Build-Project ".\test_gpt2cu$exe_suffix" ".\test_gpt2$gpu_src_suffix" $cuflags "nvcc"
   }
   "train_gpt2"
   {
-    Build-Train
+    Build-Project ".\train_gpt2$exe_suffix" ".\train_gpt2$src_suffix" $cflags
   }
   "test_gpt2"
   {
-    Build-Test
+    Build-Project ".\test_gpt2$exe_suffix" ".\test_gpt2$src_suffix" $cflags
+  }
+  "train_gpt2_cu"
+  {
+    Build-Project ".\train_gpt2cu$exe_suffix" ".\train_gpt2$gpu_src_suffix" $cuflags "nvcc"
+  }
+  "test_gpt2_cu"
+  {
+    Build-Project ".\test_gpt2cu$exe_suffix" ".\test_gpt2$gpu_src_suffix" $cuflags "nvcc"
+  }
+  "help"
+  {
+    Write-Host "Usage: `n`-target [all|train_gpt2|test_gpt2|train_gpt2_cu|test_gpt2_cu]`n`Specify the target to build. Defaults to 'all'."
+  }
+  default
+  {
+    Write-Host "Unknown target. Use 'help' for command usage."
   }
 }
+
