@@ -595,7 +595,7 @@ typedef struct {
     ParameterTensors params;
     size_t param_sizes[NUM_PARAMETER_TENSORS];
     float* params_memory;
-    int num_parameters;
+    size_t num_parameters;
     // gradients of the weights
     ParameterTensors grads;
     float* grads_memory;
@@ -606,7 +606,7 @@ typedef struct {
     ActivationTensors acts;
     size_t act_sizes[NUM_ACTIVATION_TENSORS];
     float* acts_memory;
-    int num_activations;
+    size_t num_activations;
     // gradients of the activations
     ActivationTensors grads_acts;
     float* grads_acts_memory;
@@ -669,13 +669,13 @@ void gpt2_build_from_checkpoint(GPT2 *model, char *checkpoint_path) {
     model->param_sizes[14] = C; // lnfw
     model->param_sizes[15] = C; // lnfb
 
-  // cound the number of paramaters
-  size_t num_parameters = 0;
-  for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
-    num_parameters += model->param_sizes[i];
-  }
-  printf("num_parameters: %zu\n", num_parameters);
-  model->num_parameters = num_parameters;
+    // count the number of parameters
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        num_parameters += model->param_sizes[i];
+    }
+    printf("num_parameters: %zu\n", num_parameters);
+    model->num_parameters = num_parameters;
 
   // read in all the parameters from file
   model->params_memory =
