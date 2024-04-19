@@ -10,7 +10,7 @@ if (-not $compiler)
 }
 
 # Compiler flags
-$cflags = @("-O3", "-Ofast", "-Wno-unused-result", "-fopenmp", "-DOMP")
+$cflags = @("-O3", "-fno-finite-math-only", "-Wno-unused-result", "-march=native", "-fopenmp", "-DOMP")
 $cuflags = @("-O3", "--use_fast_math", "-lcublas", "-lcublasLt", "-Xcompiler", "/wd4819")
 
 # File names setup
